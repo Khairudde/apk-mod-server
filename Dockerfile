@@ -1,16 +1,16 @@
 
-# Use an official Python runtime as a parent image
-FROM python:3.10-slim-buster
+# Use a more modern and supported base image (Debian Bookworm)
+FROM python:3.10-slim-bookworm
 
 # Set environment variables for non-interactive installation
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Java Development Kit (JDK) for apktool and uber-apk-signer
-RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jdk \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Install wget and unzip for downloading tools
-RUN apt-get update && apt-get install -y --no-install-recommends wget unzip \
+# Debian Bookworm includes openjdk-17-jdk in its standard repositories
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jdk \
+    wget \
+    unzip \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install apktool
