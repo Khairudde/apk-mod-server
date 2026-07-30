@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, BackgroundTasks
 from pydantic import BaseModel
 import os
@@ -21,26 +20,23 @@ app = FastAPI(
 # Taskade Webhook URL for callback
 TASKADE_CALLBACK_URL = "https://www.taskade.com/webhooks/flow/01KYTC913RS4RAANYE45FP721P/sync"
 
-class APKInstructionPayload(BaseModel):
-    nama_apk: str
-    instruksi: str
-    request_id: str
-    apk_download_url: str | None = None
-
 APK_STORAGE_DIR = "./apk_storage"
 
 @app.on_event("startup")
 async def startup_event():
-    os.makedirs(APK_STORAGE_DIR, exist_ok=True)
+    if not os.path.exists(APK_STORAGE_DIR):
+        os.makedirs(APK_STORAGE_DIR, exist_ok=True)
+    logging.info(f"APK storage directory ready: {APK_STORAGE_DIR}")
 
 @app.get("/")
 async def root():
-    return {"message": "AI APK Auto-Modder with Taskade Callback is active", "status": "online"}
+    return {"message": "AI APK Auto-Modder is active", "status": "online"}
 
 async def call_uncensored_ai(instructions: str):
     """Calls an uncensored model on Hugging Face to translate user intent into technical patches."""
     HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
     if not HUGGINGFACE_API_TOKEN:
+        logging.warning("HUGGINGFACE_API_TOKEN is missing!")
         return None
 
     model_id = "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO" 
@@ -119,9 +115,8 @@ async def send_callback_to_taskade(request_id, status, download_url):
         logging.error(f"Taskade callback failed: {e}")
         return False
 
-async def process_mod_task(payload: APKInstructionPayload, apk_file_path: str):
+async def process_mod_task(request_id: str, nama_apk: str, instruksi: str, apk_file_path: str):
     """Background task to handle the long-running modding process."""
-    request_id = payload.request_id
     decompiled_dir = os.path.join(APK_STORAGE_DIR, f"work_{request_id}")
     unsigned_apk = os.path.join(APK_STORAGE_DIR, f"{request_id}_unsigned.apk")
     
@@ -129,20 +124,13 @@ async def process_mod_task(payload: APKInstructionPayload, apk_file_path: str):
     status = "error"
 
     try:
-        # 1. Decompile
         subprocess.run(["apktool", "d", apk_file_path, "-o", decompiled_dir, "-f"], check=True)
-
-        # 2. AI Analysis & Patching
-        logging.info("Calling Uncensored AI for patching strategy...")
-        patches = await call_uncensored_ai(payload.instruksi)
+        patches = await call_uncensored_ai(instruksi)
         if patches:
             apply_patches(decompiled_dir, patches)
-
-        # 3. Rebuild & Sign
         subprocess.run(["apktool", "b", decompiled_dir, "-o", unsigned_apk], check=True)
         subprocess.run(["java", "-jar", "/usr/local/bin/uber-apk-signer.jar", "--apks", unsigned_apk], check=True)
         
-        # Find signed APK
         signed_apk = None
         for f in os.listdir(APK_STORAGE_DIR):
             if f.startswith(f"{request_id}_unsigned") and f.endswith("-aligned-signed.apk"):
@@ -150,51 +138,45 @@ async def process_mod_task(payload: APKInstructionPayload, apk_file_path: str):
                 break
         
         if signed_apk:
-            # 4. Upload
             download_url = await upload_to_file_io(signed_apk)
             if download_url:
                 status = "success"
-        
     except Exception as e:
         logging.error(f"Background process failed: {e}")
     finally:
-        # 5. Send Callback to Taskade
         await send_callback_to_taskade(request_id, status, download_url)
-        
-        # Cleanup
-        if os.path.exists(apk_file_path): os.remove(apk_file_path)
-        if os.path.exists(unsigned_apk): os.remove(unsigned_apk)
-        if os.path.exists(decompiled_dir): shutil.rmtree(decompiled_dir)
+        try:
+            if os.path.exists(apk_file_path): os.remove(apk_file_path)
+            if os.path.exists(unsigned_apk): os.remove(unsigned_apk)
+            if os.path.exists(decompiled_dir): shutil.rmtree(decompiled_dir)
+            for f in os.listdir(APK_STORAGE_DIR):
+                if f.startswith(f"{request_id}_unsigned"):
+                    os.remove(os.path.join(APK_STORAGE_DIR, f))
+        except Exception as cleanup_error:
+            logging.error(f"Cleanup error: {cleanup_error}")
 
 @app.post("/mod_apk")
 async def mod_apk_endpoint(
     background_tasks: BackgroundTasks,
-    payload: APKInstructionPayload = Form(...),
+    nama_apk: str = Form(...),
+    instruksi: str = Form(...),
+    request_id: str = Form(...),
+    apk_download_url: str | None = Form(None),
     apk_file: UploadFile | None = File(None)
 ):
-    request_id = payload.request_id
+    logging.info(f"Received request: request_id={request_id}")
     temp_apk_path = os.path.join(APK_STORAGE_DIR, f"{request_id}_temp.apk")
-
     try:
-        # Get APK
         if apk_file:
             with open(temp_apk_path, "wb") as f: shutil.copyfileobj(apk_file.file, f)
-        elif payload.apk_download_url:
+        elif apk_download_url:
             async with httpx.AsyncClient() as client:
-                res = await client.get(payload.apk_download_url)
+                res = await client.get(apk_download_url)
                 with open(temp_apk_path, "wb") as f: f.write(res.content)
         else:
-            return {"status": "error", "message": "No APK provided"}
-        
-        # Run the heavy processing in the background
-        background_tasks.add_task(process_mod_task, payload, temp_apk_path)
-        
-        return {
-            "status": "processing",
-            "request_id": request_id,
-            "message": "Modification started in background. Taskade will be notified upon completion."
-        }
-
+            raise HTTPException(status_code=400, detail="No APK provided")
+        background_tasks.add_task(process_mod_task, request_id, nama_apk, instruksi, temp_apk_path)
+        return {"status": "processing", "request_id": request_id}
     except Exception as e:
         logging.error(f"Endpoint failed: {e}")
         return {"status": "error", "message": str(e)}
