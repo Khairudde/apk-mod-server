@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 import os
@@ -6,99 +5,156 @@ import subprocess
 import httpx
 import logging
 import shutil
+import uvicorn
+import re
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = FastAPI(
-    title="APK Modding Webhook Server",
-    description="API to automate APK decompilation, modification, recompilation, and signing."
+    title="AI APK Auto-Modder",
+    description="Automated APK modification using Uncensored AI and Smart Patching."
 )
 
-# Define the expected JSON payload structure for instructions
 class APKInstructionPayload(BaseModel):
     nama_apk: str
     instruksi: str
     request_id: str
     apk_download_url: str | None = None
 
-# Directory to store APKs and processed files
 APK_STORAGE_DIR = "./apk_storage"
 
 @app.on_event("startup")
 async def startup_event():
-    if not os.path.exists(APK_STORAGE_DIR):
-        os.makedirs(APK_STORAGE_DIR, exist_ok=True)
-    logging.info(f"APK storage directory ready: {APK_STORAGE_DIR}")
+    os.makedirs(APK_STORAGE_DIR, exist_ok=True)
 
 @app.get("/")
 async def root():
-    return {"message": "APK Modding Server is running", "status": "ok"}
+    return {"message": "AI APK Auto-Modder is active", "status": "online"}
+
+async def call_uncensored_ai(instructions: str):
+    """Calls an uncensored model on Hugging Face to translate user intent into technical patches."""
+    HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
+    if not HUGGINGFACE_API_TOKEN:
+        return None
+
+    model_id = "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO" 
+    api_url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = {"Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}"}
+    
+    system_prompt = (
+        "You are an expert Android reverse engineer. Translate user instructions into a JSON list of patches. "
+        "Each patch must have: 'file_pattern' (regex for filename), 'find' (regex/string to find), and 'replace' (string to replace). "
+        "Focus on smali code. Output ONLY the JSON object. Example: {'patches': [{'file_pattern': '.*Player.*\\\\.smali', 'find': 'const/4 v0, 0x0', 'replace': 'const/4 v0, 0x1'}]}"
+    )
+    
+    prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{instructions}<|im_end|>\n<|im_start|>assistant\n"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(api_url, headers=headers, json={"inputs": prompt, "parameters": {"max_new_tokens": 1000}}, timeout=60.0)
+            result = response.json()
+            text = result[0]['generated_text'] if isinstance(result, list) else result['generated_text']
+            json_match = re.search(r'\{.*\}', text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+    except Exception as e:
+        logging.error(f"AI Error: {e}")
+    return None
+
+def apply_patches(decompiled_dir, patches_data):
+    """Walks through files and applies regex patches."""
+    if not patches_data or 'patches' not in patches_data:
+        return False
+    
+    modified_count = 0
+    for root, dirs, files in os.walk(decompiled_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            for patch in patches_data['patches']:
+                try:
+                    if re.search(patch['file_pattern'], file_path):
+                        with open(file_path, 'r', errors='ignore') as f:
+                            content = f.read()
+                        new_content = re.sub(patch['find'], patch['replace'], content)
+                        if new_content != content:
+                            with open(file_path, 'w') as f:
+                                f.write(new_content)
+                            modified_count += 1
+                            logging.info(f"Patched: {file_path}")
+                except Exception as e:
+                    logging.error(f"Patch error on {file_path}: {e}")
+    return modified_count > 0
+
+async def upload_to_file_io(file_path):
+    """Uploads the modded APK to file.io for temporary public download."""
+    try:
+        async with httpx.AsyncClient() as client:
+            with open(file_path, "rb") as f:
+                response = await client.post("https://file.io", files={"file": f})
+                return response.json().get("link")
+    except Exception as e:
+        logging.error(f"Upload error: {e}")
+    return None
 
 @app.post("/mod_apk")
 async def mod_apk_endpoint(
     payload: APKInstructionPayload = Form(...),
     apk_file: UploadFile | None = File(None)
 ):
-    logging.info(f"Received request for APK modification: {payload.request_id}")
-    
-    apk_filename = payload.nama_apk
-    instructions_text = payload.instruksi
     request_id = payload.request_id
-    apk_download_url = payload.apk_download_url
-
-    original_apk_path = os.path.join(APK_STORAGE_DIR, f"{request_id}_{apk_filename}")
-    decompiled_output_dir = os.path.join(APK_STORAGE_DIR, f"decompiled_{request_id}")
-    unsigned_apk_path = os.path.join(APK_STORAGE_DIR, f"unsigned_modded_{request_id}_{apk_filename}")
+    original_apk_path = os.path.join(APK_STORAGE_DIR, f"{request_id}_orig.apk")
+    decompiled_dir = os.path.join(APK_STORAGE_DIR, f"work_{request_id}")
+    unsigned_apk = os.path.join(APK_STORAGE_DIR, f"{request_id}_unsigned.apk")
 
     try:
         if apk_file:
-            with open(original_apk_path, "wb") as buffer:
-                shutil.copyfileobj(apk_file.file, buffer)
-        elif apk_download_url:
+            with open(original_apk_path, "wb") as f: shutil.copyfileobj(apk_file.file, f)
+        elif payload.apk_download_url:
             async with httpx.AsyncClient() as client:
-                response = await client.get(apk_download_url)
-                response.raise_for_status() 
-                with open(original_apk_path, "wb") as buffer:
-                    buffer.write(response.content)
+                res = await client.get(payload.apk_download_url)
+                with open(original_apk_path, "wb") as f: f.write(res.content)
         else:
-            raise HTTPException(status_code=400, detail="No APK provided.")
+            return {"status": "error", "message": "No APK provided"}
         
-        logging.info(f"Decompiling {apk_filename}...")
-        subprocess.run(["apktool", "d", original_apk_path, "-o", decompiled_output_dir, "-f"], check=True, capture_output=True, text=True)
+        subprocess.run(["apktool", "d", original_apk_path, "-o", decompiled_dir, "-f"], check=True)
 
-        # Placeholder for modifications
-        logging.info("Applying modifications...")
+        logging.info("Calling Uncensored AI for patching strategy...")
+        patches = await call_uncensored_ai(payload.instruksi)
+        patch_success = False
+        if patches:
+            patch_success = apply_patches(decompiled_dir, patches)
 
-        logging.info("Recompiling...")
-        subprocess.run(["apktool", "b", decompiled_output_dir, "-o", unsigned_apk_path], check=True, capture_output=True, text=True)
-
-        logging.info("Signing...")
-        subprocess.run(["java", "-jar", "/usr/local/bin/uber-apk-signer.jar", "--apks", unsigned_apk_path], check=True, capture_output=True, text=True)
+        subprocess.run(["apktool", "b", decompiled_dir, "-o", unsigned_apk], check=True)
+        subprocess.run(["java", "-jar", "/usr/local/bin/uber-apk-signer.jar", "--apks", unsigned_apk], check=True)
         
-        signed_apk_found = None
+        signed_apk = None
         for f in os.listdir(APK_STORAGE_DIR):
-            if f.startswith(f"unsigned_modded_{request_id}_{apk_filename.replace('.apk', '')}") and f.endswith("-aligned-signed.apk"):
-                signed_apk_found = os.path.join(APK_STORAGE_DIR, f)
+            if f.startswith(f"{request_id}_unsigned") and f.endswith("-aligned-signed.apk"):
+                signed_apk = os.path.join(APK_STORAGE_DIR, f)
                 break
         
-        if not signed_apk_found:
-            raise HTTPException(status_code=500, detail="Signed APK not found.")
+        if not signed_apk: raise Exception("Signing failed")
 
-        return {"message": "Success", "request_id": request_id, "modded_apk_path": signed_apk_found}
+        download_url = await upload_to_file_io(signed_apk)
+        
+        return {
+            "status": "success",
+            "request_id": request_id,
+            "download_url": download_url,
+            "patch_applied": patch_success,
+            "ai_strategy": patches
+        }
 
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Tool error: {e.stderr}")
-        raise HTTPException(status_code=500, detail=f"Tool error: {e.stderr}")
     except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Process failed: {e}")
+        return {"status": "error", "message": str(e)}
     finally:
         if os.path.exists(original_apk_path): os.remove(original_apk_path)
-        if os.path.exists(unsigned_apk_path): os.remove(unsigned_apk_path)
-        if os.path.exists(decompiled_output_dir): shutil.rmtree(decompiled_output_dir)
+        if os.path.exists(unsigned_apk): os.remove(unsigned_apk)
+        if os.path.exists(decompiled_dir): shutil.rmtree(decompiled_dir)
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
