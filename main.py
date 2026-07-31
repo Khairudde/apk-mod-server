@@ -1,5 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, BackgroundTasks
-from pydantic import BaseModel
+
 import os
 import subprocess
 import httpx
@@ -8,6 +7,8 @@ import shutil
 import uvicorn
 import re
 import json
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, BackgroundTasks
+from pydantic import BaseModel
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,7 +56,11 @@ async def call_uncensored_ai(instructions: str):
         async with httpx.AsyncClient() as client:
             response = await client.post(api_url, headers=headers, json={"inputs": prompt, "parameters": {"max_new_tokens": 1000}}, timeout=60.0)
             result = response.json()
-            text = result[0]['generated_text'] if isinstance(result, list) else result['generated_text']
+            if isinstance(result, list):
+                text = result[0]['generated_text']
+            else:
+                text = result.get('generated_text', '')
+                
             json_match = re.search(r'\{.*\}', text, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
@@ -124,10 +129,13 @@ async def process_mod_task(request_id: str, nama_apk: str, instruksi: str, apk_f
     status = "error"
 
     try:
+        logging.info(f"Processing mod for {nama_apk} (ID: {request_id})")
         subprocess.run(["apktool", "d", apk_file_path, "-o", decompiled_dir, "-f"], check=True)
+        
         patches = await call_uncensored_ai(instruksi)
         if patches:
             apply_patches(decompiled_dir, patches)
+            
         subprocess.run(["apktool", "b", decompiled_dir, "-o", unsigned_apk], check=True)
         subprocess.run(["java", "-jar", "/usr/local/bin/uber-apk-signer.jar", "--apks", unsigned_apk], check=True)
         
@@ -175,6 +183,7 @@ async def mod_apk_endpoint(
                 with open(temp_apk_path, "wb") as f: f.write(res.content)
         else:
             raise HTTPException(status_code=400, detail="No APK provided")
+            
         background_tasks.add_task(process_mod_task, request_id, nama_apk, instruksi, temp_apk_path)
         return {"status": "processing", "request_id": request_id}
     except Exception as e:
